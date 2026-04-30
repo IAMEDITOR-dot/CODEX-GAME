@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Endless Room Maze</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#111; color:#fff; font-family:Arial,sans-serif; }
+    #ui { position:fixed; inset:0; pointer-events:none; }
+    #hint { position:absolute; top:12px; left:12px; background:rgba(0,0,0,.6); padding:8px 10px; border-radius:8px; font-size:13px; }
+    #crosshair { position:absolute; left:50%; top:50%; width:8px; height:8px; margin:-4px 0 0 -4px; border:2px solid #fff; border-radius:50%; }
+    #lockBtn { pointer-events:auto; position:absolute; right:12px; top:12px; padding:8px 12px; border:0; border-radius:8px; background:#2f66ff; color:#fff; cursor:pointer; }
+  </style>
+</head>
+<body>
+<div id="ui">
+  <div id="hint">Click <b>Lock Mouse</b>, move with WASD/Arrows, hold click to grab, release to drop, Space to throw.</div>
+  <div id="crosshair"></div>
+  <button id="lockBtn">Lock Mouse</button>
+</div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.165.0/build/three.module.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.165.0/examples/jsm/loaders/GLTFLoader.js';
+
+// Model URLs: pass exact links via query params (?hand=...&me=...&metalk=...)
+// or set these constants directly below.
+const params = new URLSearchParams(location.search);
+const DEFAULT_MODEL_BASE = 'https://raw.githubusercontent.com/IAMEDITOR-dot/CODEX-GAME/main/';
+const HAND_URL = params.get('hand') || (DEFAULT_MODEL_BASE + 'hand.gltf');
+const ME_URL = params.get('me') || (DEFAULT_MODEL_BASE + 'me.gltf');
+const METALK_URL = params.get('metalk') || (DEFAULT_MODEL_BASE + 'me-talk.gltf');
+
+function looksPlaceholder(url){ return /IAMEDITOR-dot\/CODEX-GAME/.test(url); }
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x181b22);
+scene.fog = new THREE.Fog(0x181b22, 15, 80);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 400);
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xb0c8ff, 0x1a130f, 0.75));
+const dir = new THREE.DirectionalLight(0xffffff, 1.1); dir.position.set(5,12,3); scene.add(dir);
+
+const player = { pos:new THREE.Vector3(0,1.6,0), vel:new THREE.Vector3(), yaw:0, pitch:0, speed:5.8 };
+const keys = {}; let holdObj = null;
+const colliders = []; const dynamic = [];
+const raycaster = new THREE.Raycaster();
+let throwQueued = false;
+
+const pivot = new THREE.Object3D(); scene.add(pivot);
+const loader = new GLTFLoader();
+let handModel = null, meModel = null, meTalkModel = null;
+let npc = null; let bubble = null;
+
+function makeBubble(text){
+  const c = document.createElement('canvas'); c.width = 512; c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height); ctx.fillStyle='rgba(255,255,255,.92)';
+  ctx.beginPath(); ctx.roundRect(8,8,496,112,22); ctx.fill();
+  ctx.fillStyle='#111'; ctx.font='bold 38px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(text, 256, 64);
+  const tex = new THREE.CanvasTexture(c);
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, transparent:true }));
+  spr.scale.set(2.4,.6,1);
+  spr.userData = { canvas:c, tex, ctx };
+  return spr;
+}
+function updateBubbleText(s, text){
+  const {canvas:c, tex, ctx} = s.userData;
+  ctx.clearRect(0,0,c.width,c.height); ctx.fillStyle='rgba(255,255,255,.92)';
+  ctx.beginPath(); ctx.roundRect(8,8,496,112,22); ctx.fill();
+  ctx.fillStyle='#111'; ctx.font='bold 38px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(text, 256, 64); tex.needsUpdate = true;
+}
+
+function addCollider(mesh){
+  mesh.geometry.computeBoundingBox();
+  colliders.push(mesh);
+}
+function crate(x,y,z,s=1,color=0x777777){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(s,s,s), new THREE.MeshStandardMaterial({color}));
+  m.position.set(x,y,z); scene.add(m); addCollider(m); return m;
+}
+function makeChair(x,z){
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({color:0x65442b});
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.12,0.8), mat); seat.position.y=0.6; g.add(seat);
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.8,0.8,0.1), mat); back.position.set(0,1,-0.35); g.add(back);
+  for(let dx of [-0.3,0.3]) for(let dz of [-0.3,0.3]){ const leg = new THREE.Mesh(new THREE.BoxGeometry(0.1,0.6,0.1), mat); leg.position.set(dx,0.3,dz); g.add(leg); }
+  g.position.set(x,0,z); g.traverse(o=>{ if(o.isMesh){ scene.add(o); o.position.add(g.position); addCollider(o); dynamic.push(o);} });
+}
+
+function chunkSeed(cx,cz){ return (cx*73856093 ^ cz*19349663) >>> 0; }
+const builtChunks = new Set();
+function buildChunk(cx,cz){
+  const key=`${cx},${cz}`; if(builtChunks.has(key)) return; builtChunks.add(key);
+  const baseX = cx*20, baseZ = cz*20;
+  const floor = new THREE.Mesh(new THREE.BoxGeometry(20,1,20), new THREE.MeshStandardMaterial({color:0x2a2f3a}));
+  floor.position.set(baseX,-0.5,baseZ); scene.add(floor);
+  const ceil = new THREE.Mesh(new THREE.BoxGeometry(20,1,20), new THREE.MeshStandardMaterial({color:0x1f2230}));
+  ceil.position.set(baseX,5,baseZ); scene.add(ceil); addCollider(ceil);
+  const doorSide = chunkSeed(cx,cz)%5; // 0..4 maybe roof
+  const walls = [
+    [0,2.2,-10,20,4.4,1], [0,2.2,10,20,4.4,1], [-10,2.2,0,1,4.4,20], [10,2.2,0,1,4.4,20]
+  ];
+  walls.forEach((w,i)=>{
+    if(i===doorSide) return;
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w[3],w[4],w[5]), new THREE.MeshStandardMaterial({color:0x3a3f50}));
+    m.position.set(baseX+w[0],w[1],baseZ+w[2]); scene.add(m); addCollider(m);
+  });
+  if(doorSide===4){ // roof door + ladder
+    const hole = new THREE.Mesh(new THREE.BoxGeometry(2,1,2), new THREE.MeshStandardMaterial({color:0x111})); hole.position.set(baseX,5,baseZ); scene.add(hole);
+    for(let i=0;i<8;i++){ const rung = crate(baseX-2,0.4+i*0.55,baseZ,1,0x888844); rung.scale.set(0.2,0.1,1.5); }
+  }
+  const count = 8 + (chunkSeed(cx+1,cz+2)%12);
+  for(let i=0;i<count;i++){
+    const r = (chunkSeed(cx*i+7, cz*i+3)%1000)/1000;
+    const x = baseX - 8 + ((i*7)%16), z = baseZ - 8 + ((i*11)%16);
+    if(r<0.35) makeChair(x,z); else {
+      const c = crate(x,0.5,z,0.8+((r*1.4)%1), 0x666666 + ((i*12345)&0x888888));
+      dynamic.push(c);
+    }
+  }
+}
+
+function loadModel(url){ return new Promise((res,rej)=>loader.load(url,g=>res(g.scene),undefined,rej)); }
+
+await Promise.all([
+  loadModel(HAND_URL).then(m=>{ handModel=m; m.scale.setScalar(0.6); pivot.add(m); }),
+  loadModel(ME_URL).then(m=>{ meModel=m; m.scale.setScalar(1); }),
+  loadModel(METALK_URL).then(m=>{ meTalkModel=m; m.scale.setScalar(1); })
+]).catch(()=>{});
+
+if(!handModel){ handModel = new THREE.Mesh(new THREE.SphereGeometry(0.2), new THREE.MeshStandardMaterial({color:0xff99aa})); pivot.add(handModel); }
+if(!meModel){ meModel = new THREE.Mesh(new THREE.CapsuleGeometry(0.4,1.2,4,8), new THREE.MeshStandardMaterial({color:0x66ff88})); }
+if(!meTalkModel){ meTalkModel = meModel.clone(); meTalkModel.traverse(o=>o.material && (o.material=o.material.clone(),o.material.color.set(0xffaa33))); }
+
+if (looksPlaceholder(HAND_URL) || looksPlaceholder(ME_URL) || looksPlaceholder(METALK_URL)) {
+  const hint = document.getElementById('hint');
+  hint.innerHTML = 'Set real model links in URL params: <b>?hand=...&me=...&metalk=...</b> (or edit constants in index.html).';
+}
+
+npc = new THREE.Group();
+meModel.visible=true; meTalkModel.visible=false;
+npc.add(meModel, meTalkModel); npc.position.set(2,0,2); scene.add(npc);
+bubble = makeBubble("HI I'M BAD AT EDITING"); bubble.position.set(0,2.6,0); npc.add(bubble);
+
+camera.position.copy(player.pos);
+
+const lockBtn=document.getElementById('lockBtn');
+lockBtn.onclick=()=>renderer.domElement.requestPointerLock();
+document.addEventListener('pointerlockchange',()=>lockBtn.style.display=document.pointerLockElement?'none':'block');
+document.addEventListener('mousemove',(e)=>{
+  if(document.pointerLockElement!==renderer.domElement) return;
+  player.yaw -= e.movementX*0.0022;
+  player.pitch = THREE.MathUtils.clamp(player.pitch - e.movementY*0.0022, -1.1, 1.1);
+});
+document.addEventListener('keydown',e=>{ keys[e.key.toLowerCase()] = true; if(e.code==='Space') throwQueued=true; });
+document.addEventListener('keyup',e=>{ keys[e.key.toLowerCase()] = false; });
+document.addEventListener('mousedown',()=>{
+  raycaster.setFromCamera(new THREE.Vector2(0,0), camera);
+  const hits = raycaster.intersectObjects(dynamic, false);
+  if(hits[0] && hits[0].distance<4){ holdObj = hits[0].object; }
+});
+document.addEventListener('mouseup',()=>{ holdObj = null; });
+
+function movePlayer(dt){
+  const fwd = new THREE.Vector3(Math.sin(player.yaw),0,Math.cos(player.yaw));
+  const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0));
+  const dir = new THREE.Vector3();
+  if(keys['w']||keys['arrowup']) dir.add(fwd);
+  if(keys['s']||keys['arrowdown']) dir.sub(fwd);
+  if(keys['a']||keys['arrowleft']) dir.sub(right);
+  if(keys['d']||keys['arrowright']) dir.add(right);
+  if(dir.lengthSq()>0) dir.normalize().multiplyScalar(player.speed*dt);
+  const next = player.pos.clone().add(dir);
+  const sphere = new THREE.Sphere(next, 0.35);
+  let blocked=false;
+  for(const c of colliders){
+    c.geometry.computeBoundingBox();
+    const box = c.geometry.boundingBox.clone().applyMatrix4(c.matrixWorld).expandByScalar(0.08);
+    if(box.intersectsSphere(sphere)){ blocked=true; break; }
+  }
+  if(!blocked) player.pos.copy(next);
+}
+
+const clock = new THREE.Clock();
+let talkSwapT = 0;
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(0.033, clock.getDelta());
+  movePlayer(dt);
+
+  camera.position.copy(player.pos);
+  camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
+
+  const handR = 1.1;
+  const handPos = new THREE.Vector3(Math.sin(player.yaw+0.7)*handR, player.pos.y-0.2+Math.sin(player.pitch)*0.3, Math.cos(player.yaw+0.7)*handR).add(player.pos);
+  pivot.position.copy(handPos);
+  pivot.rotation.set(player.pitch*0.5, player.yaw+Math.PI, 0);
+
+  if(holdObj){
+    const target = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(2.2).add(player.pos);
+    holdObj.position.lerp(target, 0.2);
+    if(throwQueued){
+      holdObj.userData.v = camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(0.9);
+      holdObj = null;
+      throwQueued = false;
+    }
+  }
+  for(const d of dynamic){
+    if(d===holdObj) continue;
+    if(d.userData.v){ d.position.add(d.userData.v); d.userData.v.multiplyScalar(0.96); }
+  }
+
+  const toPlayer = player.pos.clone().sub(npc.position).setY(0);
+  if(toPlayer.length()>1.7) npc.position.add(toPlayer.normalize().multiplyScalar(dt*2.4));
+  npc.position.y = 0.15 + Math.sin(performance.now()*0.002)*0.22;
+  npc.lookAt(player.pos.x, npc.position.y, player.pos.z);
+  const close = npc.position.distanceTo(player.pos) < 3;
+  updateBubbleText(bubble, close ? "HI I'M GOOD AT EDITING" : "HI I'M BAD AT EDITING");
+  talkSwapT += dt;
+  if(talkSwapT > 0.45){ talkSwapT = 0; meModel.visible = !meModel.visible; meTalkModel.visible = !meTalkModel.visible; }
+
+  const cx = Math.floor(player.pos.x/20), cz = Math.floor(player.pos.z/20);
+  for(let x=-1;x<=1;x++) for(let z=-1;z<=1;z++) buildChunk(cx+x,cz+z);
+
+  renderer.render(scene, camera);
+}
+animate();
+addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+</script>
+</body>
+</html>
