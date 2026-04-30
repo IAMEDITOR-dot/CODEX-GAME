@@ -55,11 +55,20 @@ const loader = new GLTFLoader();
 let handModel = null, meModel = null, meTalkModel = null;
 let npc = null; let bubble = null;
 
+function bubbleRect(ctx,x,y,w,h,r){
+  if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x,y,w,h,r); ctx.fill(); return; }
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y); ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r); ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h); ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r); ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath(); ctx.fill();
+}
+
 function makeBubble(text){
   const c = document.createElement('canvas'); c.width = 512; c.height = 128;
   const ctx = c.getContext('2d');
   ctx.clearRect(0,0,c.width,c.height); ctx.fillStyle='rgba(255,255,255,.92)';
-  ctx.beginPath(); ctx.roundRect(8,8,496,112,22); ctx.fill();
+  bubbleRect(ctx,8,8,496,112,22);
   ctx.fillStyle='#111'; ctx.font='bold 38px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
   ctx.fillText(text, 256, 64);
   const tex = new THREE.CanvasTexture(c);
@@ -71,7 +80,7 @@ function makeBubble(text){
 function updateBubbleText(s, text){
   const {canvas:c, tex, ctx} = s.userData;
   ctx.clearRect(0,0,c.width,c.height); ctx.fillStyle='rgba(255,255,255,.92)';
-  ctx.beginPath(); ctx.roundRect(8,8,496,112,22); ctx.fill();
+  bubbleRect(ctx,8,8,496,112,22);
   ctx.fillStyle='#111'; ctx.font='bold 38px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
   ctx.fillText(text, 256, 64); tex.needsUpdate = true;
 }
@@ -128,15 +137,13 @@ function buildChunk(cx,cz){
 
 function loadModel(url){ return new Promise((res,rej)=>loader.load(url,g=>res(g.scene),undefined,rej)); }
 
-await Promise.all([
-  loadModel(HAND_URL).then(m=>{ handModel=m; m.scale.setScalar(0.6); pivot.add(m); }),
-  loadModel(ME_URL).then(m=>{ meModel=m; m.scale.setScalar(1); }),
-  loadModel(METALK_URL).then(m=>{ meTalkModel=m; m.scale.setScalar(1); })
-]).catch(()=>{});
+handModel = new THREE.Mesh(new THREE.SphereGeometry(0.2), new THREE.MeshStandardMaterial({color:0xff99aa})); pivot.add(handModel);
+meModel = new THREE.Mesh(new THREE.CapsuleGeometry(0.4,1.2,4,8), new THREE.MeshStandardMaterial({color:0x66ff88}));
+meTalkModel = meModel.clone(); meTalkModel.traverse(o=>o.material && (o.material=o.material.clone(),o.material.color.set(0xffaa33)));
 
-if(!handModel){ handModel = new THREE.Mesh(new THREE.SphereGeometry(0.2), new THREE.MeshStandardMaterial({color:0xff99aa})); pivot.add(handModel); }
-if(!meModel){ meModel = new THREE.Mesh(new THREE.CapsuleGeometry(0.4,1.2,4,8), new THREE.MeshStandardMaterial({color:0x66ff88})); }
-if(!meTalkModel){ meTalkModel = meModel.clone(); meTalkModel.traverse(o=>o.material && (o.material=o.material.clone(),o.material.color.set(0xffaa33))); }
+loadModel(HAND_URL).then(m=>{ if(handModel.parent) handModel.parent.remove(handModel); handModel=m; m.scale.setScalar(0.6); pivot.add(m); }).catch(()=>{});
+loadModel(ME_URL).then(m=>{ if(npc && meModel.parent===npc) npc.remove(meModel); meModel=m; m.scale.setScalar(1); if(npc) npc.add(meModel); }).catch(()=>{});
+loadModel(METALK_URL).then(m=>{ if(npc && meTalkModel.parent===npc) npc.remove(meTalkModel); meTalkModel=m; m.scale.setScalar(1); if(npc){ meTalkModel.visible=!meModel.visible; npc.add(meTalkModel);} }).catch(()=>{});
 
 if (looksPlaceholder(HAND_URL) || looksPlaceholder(ME_URL) || looksPlaceholder(METALK_URL)) {
   const hint = document.getElementById('hint');
@@ -149,6 +156,7 @@ npc.add(meModel, meTalkModel); npc.position.set(2,0,2); scene.add(npc);
 bubble = makeBubble("HI I'M BAD AT EDITING"); bubble.position.set(0,2.6,0); npc.add(bubble);
 
 camera.position.copy(player.pos);
+buildChunk(0,0);
 
 const lockBtn=document.getElementById('lockBtn');
 lockBtn.onclick=()=>renderer.domElement.requestPointerLock();
@@ -195,6 +203,7 @@ function animate(){
   movePlayer(dt);
 
   camera.position.copy(player.pos);
+buildChunk(0,0);
   camera.rotation.set(player.pitch, player.yaw, 0, 'YXZ');
 
   const handR = 1.1;
